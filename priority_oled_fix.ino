@@ -1,87 +1,120 @@
 #include <Arduino.h>
 #include <Adafruit_SSD1306.h>
 
-#define MAX_VOLTAGE 350
-#define THRESHOLD_MIN 150
-#define THRESHOLD_MAX 250
-#define HYSTERESIS_TIME 1000 // The time to wait before switching to DC or AC after the voltage crosses the threshold.
-#define MAX_ON_TIME 300 // The maximum time to keep the kettle on DC after the voltage crosses the threshold.
-#define MAX_OFF_TIME 1000 // The maximum time to keep the kettle on AC after the voltage drops below the threshold.
+// --- Configuration ---
+#define MAX_VOLTAGE 350.0   // Maximum voltage we expect to measure (scaled)
+#define THRESHOLD_MIN 150   // Minimum threshold for priority knob (Volts)
+#define THRESHOLD_MAX 250   // Maximum threshold for priority knob (Volts)
+
+// Hysteresis configuration: How long to wait before switching
+#define HYSTERESIS_MS 1000
+
+// Priority timing configuration
+#define PRIORITY_WAIT_MIN_MS 5000     // 5 seconds at high priority
+#define PRIORITY_WAIT_MAX_MS 300000   // 5 minutes at low priority
 
 const int dcVoltagePin = A0;
 const int priorityKnobPin = A1;
 const int kettlePin = 13;
 
-int dcVoltage;
-int priority;
-int threshold;
-int time;
-int previousVoltage;
-int resistor1 = 10000;
-int resistor2 = 1000;
+// Voltage divider resistors
+const float R1 = 100000.0; // 100k
+const float R2 = 1000.0;   // 1k
 
-Adafruit_SSD1306 display(128, 32, SSD1306_SWITCHCAPVCC, 0x3C);
+// --- State Variables ---
+float currentVoltage = 0;
+int currentThreshold = 200;
+unsigned long waitTimeLimit = 5000;
+unsigned long lastSwitchTime = 0;
+unsigned long lastAboveThresholdTime = 0;
+bool kettleOnDC = false;
+
+Adafruit_SSD1306 display(128, 32, &Wire, -1);
 
 void setup() {
   pinMode(dcVoltagePin, INPUT);
   pinMode(priorityKnobPin, INPUT);
   pinMode(kettlePin, OUTPUT);
+  digitalWrite(kettlePin, LOW); // Start with AC (OFF)
 
-  display.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
 }
 
-int readVoltage() {
-  int rawVoltage = analogRead(dcVoltagePin);
-  // Scale the voltage using the voltage divider.
-  float voltage = (rawVoltage * resistor2) / (resistor1 + resistor2);
-  // Constrain the voltage to the range 0-MAX_VOLTAGE.
-  voltage = constrain(voltage, 0, MAX_VOLTAGE);
-  return voltage;
+float readVoltage() {
+  int raw = analogRead(dcVoltagePin);
+  // Formula for voltage divider: Vout = Vin * R2 / (R1 + R2)
+  // Vin = Vout * (R1 + R2) / R2
+  // Vout = raw * (5.0 / 1023.0)
+  float vOut = raw * (5.0 / 1023.0);
+  float vIn = vOut * (R1 + R2) / R2;
+  return vIn;
 }
 
-void drawGauge(int voltage) {
+void updateDisplay() {
   display.clearDisplay();
-  display.drawRect(0, 0, 128, 32, WHITE);
-  int gaugeValue = map(voltage, 0, MAX_VOLTAGE, 0, 128);
-  display.fillRect(0, 0, gaugeValue, 32, BLACK);
-  display.drawLine(0, 16, 128, 16, WHITE);
-  // Draw the threshold marker.
-  int thresholdValue = map(threshold, 0, MAX_VOLTAGE, 0, 128);
-  display.drawLine(thresholdValue, 0, thresholdValue, 32, RED);
-  display.setCursor(64, 16);
-  display.print(voltage);
+
+  // Draw gauge border
+  display.drawRect(0, 22, 128, 10, WHITE);
+
+  // Fill gauge based on voltage
+  int fillWidth = map(constrain(currentVoltage, 0, MAX_VOLTAGE), 0, MAX_VOLTAGE, 0, 126);
+  display.fillRect(1, 23, fillWidth, 8, WHITE);
+
+  // Draw threshold marker
+  int thresholdX = map(currentThreshold, 0, MAX_VOLTAGE, 0, 126);
+  display.drawLine(thresholdX + 1, 20, thresholdX + 1, 32, WHITE);
+
+  // Status text
+  display.setCursor(0, 0);
+  display.print("V: "); display.print(currentVoltage, 1);
+  display.print(" T: "); display.print(currentThreshold);
+
+  display.setCursor(0, 10);
+  if (kettleOnDC) {
+    display.print("POWER: SOLAR (DC)");
+  } else {
+    display.print("POWER: GRID (AC)");
+  }
+
   display.display();
 }
 
 void loop() {
-  priority = analogRead(priorityKnobPin);
-  threshold = map(priority, 0, 1023, THRESHOLD_MIN, THRESHOLD_MAX);
-  time = map(priority, 0, 1023, MAX_ON_TIME, MAX_OFF_TIME);
+  // 1. Read Inputs
+  int priorityRaw = analogRead(priorityKnobPin);
+  currentThreshold = map(priorityRaw, 0, 1023, THRESHOLD_MIN, THRESHOLD_MAX);
+  waitTimeLimit = map(priorityRaw, 0, 1023, PRIORITY_WAIT_MAX_MS, PRIORITY_WAIT_MIN_MS);
 
-  dcVoltage = readVoltage();
+  currentVoltage = readVoltage();
+  unsigned long now = millis();
 
-  // Check if the voltage is below the threshold and if the previous voltage was above the threshold.
-  if (dcVoltage < threshold && previousVoltage >= threshold) {
-    // Switch to AC.
-    delay(HYSTERESIS_TIME);
-    digitalWrite(kettlePin, LOW);
-  }
+  // 2. Logic
+  if (currentVoltage >= currentThreshold) {
+    lastAboveThresholdTime = now;
 
-  // Check if the voltage is above the threshold and if the previous voltage was below the threshold.
-  else if (dcVoltage >= threshold && previousVoltage < threshold) {
-    // Switch to DC.
-    delay(HYSTERESIS_TIME);
-    digitalWrite(kettlePin, HIGH);
+    // If we're on AC and voltage has been good for HYSTERESIS_MS, switch to DC
+    if (!kettleOnDC && (now - lastSwitchTime >= HYSTERESIS_MS)) {
+        kettleOnDC = true;
+        digitalWrite(kettlePin, HIGH);
+        lastSwitchTime = now;
+    }
   } else {
-    // If the voltage is still below the threshold, but the previous voltage was above the threshold,
-    // then keep the kettle on DC for a certain time.
-    if (dcVoltage < threshold && previousVoltage >= threshold) {
-      delay(time);
+    // Voltage is below threshold
+    // If we're on DC and voltage has been low for more than waitTimeLimit, switch to AC
+    if (kettleOnDC && (now - lastAboveThresholdTime >= waitTimeLimit)) {
+        kettleOnDC = false;
+        digitalWrite(kettlePin, LOW);
+        lastSwitchTime = now;
     }
   }
 
-  previousVoltage = dcVoltage;
-
-  drawGauge(dcVoltage);
+  // 3. Update UI
+  static unsigned long lastDisplayUpdate = 0;
+  if (now - lastDisplayUpdate >= 200) { // Update display at 5Hz
+    updateDisplay();
+    lastDisplayUpdate = now;
+  }
 }
