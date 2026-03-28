@@ -1,87 +1,202 @@
+/**
+ * @file priority_oled_fix.ino
+ * @brief Solar Kettle Power Switcher
+ *
+ * This device automatically switches a kettle from the AC grid to a DC solar source
+ * when sufficient solar power is available. It features an OLED display for
+ * monitoring, a priority knob to adjust sensitivity, and several safety features.
+ */
+
 #include <Arduino.h>
 #include <Adafruit_SSD1306.h>
 
-#define MAX_VOLTAGE 350
-#define THRESHOLD_MIN 150
-#define THRESHOLD_MAX 250
-#define HYSTERESIS_TIME 1000 // The time to wait before switching to DC or AC after the voltage crosses the threshold.
-#define MAX_ON_TIME 300 // The maximum time to keep the kettle on DC after the voltage crosses the threshold.
-#define MAX_OFF_TIME 1000 // The maximum time to keep the kettle on AC after the voltage drops below the threshold.
+// --- Configuration Constants ---
+#define MAX_VOLTAGE 350.0       // Maximum voltage for display scale (Volts)
+#define VOLTAGE_WARN_OVER 330.0   // Alert threshold for high solar voltage
+#define VOLTAGE_FAULT_LOW 20.0    // Threshold below which sensor fault is assumed
+#define THRESHOLD_MIN 150       // Minimum threshold for priority knob (Volts)
+#define THRESHOLD_MAX 250       // Maximum threshold for priority knob (Volts)
 
-const int dcVoltagePin = A0;
-const int priorityKnobPin = A1;
-const int kettlePin = 13;
+#define HYSTERESIS_MS 2000      // Time to wait (stabilize) before switching from AC to DC
+#define PRIORITY_WAIT_MIN_MS 5000     // Minimum DC-to-AC delay (High priority)
+#define PRIORITY_WAIT_MAX_MS 300000   // Maximum DC-to-AC delay (Low priority)
 
-int dcVoltage;
-int priority;
-int threshold;
-int time;
-int previousVoltage;
-int resistor1 = 10000;
-int resistor2 = 1000;
+// Pin Definitions
+const int dcVoltagePin = A0;    // Voltage divider output
+const int priorityKnobPin = A1; // Priority potentiometer
+const int kettlePin = 13;      // Relay control (HIGH for DC/Solar, LOW for AC/Grid)
 
-Adafruit_SSD1306 display(128, 32, SSD1306_SWITCHCAPVCC, 0x3C);
+// Hardware Model (Voltage Divider)
+const float R1 = 100000.0;      // 100k
+const float R2 = 1000.0;        // 1k
+
+// --- System State and Variables ---
+enum SystemState {
+  STATE_GRID,         // Operating on AC power
+  STATE_STABILIZING,    // Solar power detected, waiting for stability before switching
+  STATE_SOLAR         // Operating on DC solar power
+};
+
+SystemState currentState = STATE_GRID;
+
+// Voltage Filtering (Moving Average)
+#define FILTER_SIZE 10
+float voltageSamples[FILTER_SIZE];
+int sampleIndex = 0;
+float filteredVoltage = 0;
+
+float currentVoltage = 0;
+int currentThreshold = 200;
+unsigned long waitTimeLimit = 5000;
+unsigned long lastSwitchTime = 0;
+unsigned long lastAboveThresholdTime = 0;
+bool kettleOnDC = false;
+bool sensorFault = false;
+bool overVoltage = false;
+
+Adafruit_SSD1306 display(128, 32, &Wire, -1);
+
+float readVoltage(); // Function prototype
 
 void setup() {
   pinMode(dcVoltagePin, INPUT);
   pinMode(priorityKnobPin, INPUT);
   pinMode(kettlePin, OUTPUT);
+  digitalWrite(kettlePin, LOW); // Start on AC (safety first)
 
-  display.begin();
+  // Initialize filter with the first valid reading
+  float initialV = readVoltage();
+  for (int i = 0; i < FILTER_SIZE; i++) voltageSamples[i] = initialV;
+  filteredVoltage = initialV;
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
 }
 
-int readVoltage() {
-  int rawVoltage = analogRead(dcVoltagePin);
-  // Scale the voltage using the voltage divider.
-  float voltage = (rawVoltage * resistor2) / (resistor1 + resistor2);
-  // Constrain the voltage to the range 0-MAX_VOLTAGE.
-  voltage = constrain(voltage, 0, MAX_VOLTAGE);
-  return voltage;
+/**
+ * Reads ADC and converts to real voltage using the divider formula.
+ * Also maintains a moving average filter.
+ */
+float readVoltage() {
+  int raw = analogRead(dcVoltagePin);
+  float vOut = raw * (5.0 / 1023.0);
+  float vIn = vOut * (R1 + R2) / R2;
+
+  voltageSamples[sampleIndex] = vIn;
+  sampleIndex = (sampleIndex + 1) % FILTER_SIZE;
+
+  float sum = 0;
+  for (int i = 0; i < FILTER_SIZE; i++) sum += voltageSamples[i];
+  filteredVoltage = sum / FILTER_SIZE;
+
+  return vIn;
 }
 
-void drawGauge(int voltage) {
+/**
+ * Updates the OLED with system status, modes, and warnings.
+ */
+void updateDisplay() {
   display.clearDisplay();
-  display.drawRect(0, 0, 128, 32, WHITE);
-  int gaugeValue = map(voltage, 0, MAX_VOLTAGE, 0, 128);
-  display.fillRect(0, 0, gaugeValue, 32, BLACK);
-  display.drawLine(0, 16, 128, 16, WHITE);
-  // Draw the threshold marker.
-  int thresholdValue = map(threshold, 0, MAX_VOLTAGE, 0, 128);
-  display.drawLine(thresholdValue, 0, thresholdValue, 32, RED);
-  display.setCursor(64, 16);
-  display.print(voltage);
+
+  if (sensorFault) {
+    display.setCursor(0, 0);
+    display.print("! SENSOR FAULT !");
+    display.setCursor(0, 12);
+    display.print("Check Connections");
+    display.display();
+    return;
+  }
+
+  display.setCursor(0, 0);
+  display.print("V:"); display.print(currentVoltage, 0);
+  display.print(" T:"); display.print(kettleOnDC ? (int)(currentThreshold * 0.8) : currentThreshold);
+  if (overVoltage) display.print(" !OV!");
+
+  display.setCursor(0, 10);
+  switch (currentState) {
+    case STATE_GRID:
+      display.print("MODE: GRID (AC)");
+      break;
+    case STATE_STABILIZING:
+      display.print("MODE: STABILIZING...");
+      display.print((int)((HYSTERESIS_MS - (millis() - lastSwitchTime)) / 100));
+      break;
+    case STATE_SOLAR:
+      display.print("MODE: SOLAR (DC)");
+      if (filteredVoltage < (currentThreshold * 0.8)) {
+          int remaining = (int)((waitTimeLimit - (millis() - lastAboveThresholdTime)) / 1000);
+          display.print(" ("); display.print(remaining); display.print("s)");
+      }
+      break;
+  }
+
+  display.drawRect(0, 22, 128, 10, WHITE);
+  int fillWidth = map(constrain(currentVoltage, 0, MAX_VOLTAGE), 0, MAX_VOLTAGE, 0, 126);
+  display.fillRect(1, 23, fillWidth, 8, WHITE);
+  int thresholdX = map(currentThreshold, 0, MAX_VOLTAGE, 0, 126);
+  display.drawLine(thresholdX + 1, 20, thresholdX + 1, 32, WHITE);
+
   display.display();
 }
 
 void loop() {
-  priority = analogRead(priorityKnobPin);
-  threshold = map(priority, 0, 1023, THRESHOLD_MIN, THRESHOLD_MAX);
-  time = map(priority, 0, 1023, MAX_ON_TIME, MAX_OFF_TIME);
+  // 1. Inputs and fault detection
+  int priorityRaw = analogRead(priorityKnobPin);
+  currentThreshold = map(priorityRaw, 0, 1023, THRESHOLD_MIN, THRESHOLD_MAX);
+  waitTimeLimit = map(priorityRaw, 0, 1023, PRIORITY_WAIT_MAX_MS, PRIORITY_WAIT_MIN_MS);
 
-  dcVoltage = readVoltage();
+  currentVoltage = readVoltage();
+  unsigned long now = millis();
 
-  // Check if the voltage is below the threshold and if the previous voltage was above the threshold.
-  if (dcVoltage < threshold && previousVoltage >= threshold) {
-    // Switch to AC.
-    delay(HYSTERESIS_TIME);
-    digitalWrite(kettlePin, LOW);
-  }
+  sensorFault = (filteredVoltage < VOLTAGE_FAULT_LOW);
+  overVoltage = (filteredVoltage > VOLTAGE_WARN_OVER);
 
-  // Check if the voltage is above the threshold and if the previous voltage was below the threshold.
-  else if (dcVoltage >= threshold && previousVoltage < threshold) {
-    // Switch to DC.
-    delay(HYSTERESIS_TIME);
-    digitalWrite(kettlePin, HIGH);
+  // 2. State Machine Logic
+  if (sensorFault) {
+      if (kettleOnDC) {
+          kettleOnDC = false;
+          digitalWrite(kettlePin, LOW);
+          lastSwitchTime = now;
+      }
+      currentState = STATE_GRID;
   } else {
-    // If the voltage is still below the threshold, but the previous voltage was above the threshold,
-    // then keep the kettle on DC for a certain time.
-    if (dcVoltage < threshold && previousVoltage >= threshold) {
-      delay(time);
-    }
+      // Use adaptive threshold when active to account for voltage drop under load.
+      int effectiveThreshold = kettleOnDC ? (currentThreshold * 0.8) : currentThreshold;
+
+      if (filteredVoltage >= effectiveThreshold) {
+          lastAboveThresholdTime = now;
+
+          if (!kettleOnDC) {
+              if (currentState != STATE_STABILIZING) {
+                  currentState = STATE_STABILIZING;
+                  lastSwitchTime = now;
+              } else if (now - lastSwitchTime >= HYSTERESIS_MS) {
+                  kettleOnDC = true;
+                  digitalWrite(kettlePin, HIGH);
+                  lastSwitchTime = now;
+                  currentState = STATE_SOLAR;
+              }
+          }
+      } else {
+          // Below threshold: handle switching back to AC
+          if (kettleOnDC && (now - lastAboveThresholdTime >= waitTimeLimit)) {
+              kettleOnDC = false;
+              digitalWrite(kettlePin, LOW);
+              lastSwitchTime = now;
+              currentState = STATE_GRID;
+          } else if (!kettleOnDC) {
+              currentState = STATE_GRID;
+          }
+      }
   }
 
-  previousVoltage = dcVoltage;
-
-  drawGauge(dcVoltage);
+  // 3. UI Update (Non-blocking)
+  static unsigned long lastDisplayUpdate = 0;
+  if (now - lastDisplayUpdate >= 200) {
+    currentVoltage = filteredVoltage; // Use smoothed voltage for UI
+    updateDisplay();
+    lastDisplayUpdate = now;
+  }
 }
